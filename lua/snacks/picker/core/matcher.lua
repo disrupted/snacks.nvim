@@ -88,20 +88,20 @@ function M:on_match(picker, item)
   if self.opts.on_match then
     self.opts.on_match(self, item)
   end
+end
 
-  if not self.opts.keep_parents or item.score == 0 then
-    return
-  end
-
-  local parent = item.parent
+--- Mark the ancestors of a matched item as required for tree context.
+--- Only mutates item state; does not add anything to the list.
+---@param item snacks.picker.Item
+function M:mark_parents(item)
   item.child_match_only = false
+  local parent = item.parent
   while parent and not parent.root do
     if parent.score == 0 or parent.match_tick ~= self.tick then
       parent.score = 1
       parent.child_match_only = true
       parent.match_tick = self.tick
       parent.match_topk = nil
-      picker.list:add(parent, self.sorting)
     else
       break
     end
@@ -147,63 +147,104 @@ function M:run(picker)
   self.task = Async.new(function()
     local yield = Async.yielder(YIELD_MATCH)
 
-    ---@async
-    ---@param item snacks.picker.Item
-    local function check(item)
-      if self:update(picker, item) then
-        picker.list:add(item, self.sorting)
-      end
-      yield()
-    end
+    if self.opts.keep_parents then
+      -- Two-pass approach for keep_parents:
+      --
+      -- Pass 1 (score): score every item and mark required ancestors via
+      -- mark_parents(). This is pure state mutation; nothing is added to
+      -- the list yet, so parent/child insertion order is irrelevant here.
+      --
+      -- Pass 2 (emit): walk finder.items in source order and add every item
+      -- that either matched directly or was marked as a required ancestor.
+      -- Because we iterate in source order, parents always precede their
+      -- children naturally -- no post-hoc sort needed.
 
-    local count = #picker.finder.items
+      -- Pass 1: score all items
+      local idx = 0
+      repeat
+        while idx < #picker.finder.items do
+          idx = idx + 1
+          local item = picker.finder.items[idx]
+          if item.match_tick ~= self.tick then
+            self:update(picker, item)
+            if item.score > 0 then
+              self:mark_parents(item)
+            end
+          end
+          yield()
+        end
 
-    -- process topk first
-    for i = 1, count do
-      local item = picker.finder.items[i]
-      if item.match_topk then
-        item.match_topk = nil
-        check(item)
-      else
-        item.match_topk = nil
-      end
-    end
+        if picker.finder.task:running() then
+          Async.suspend()
+        end
+      until idx >= #picker.finder.items and not picker.finder.task:running()
 
-    -- process matches next
-    for i = 1, count do
-      local item = picker.finder.items[i]
-      if item.score > 0 and item.match_tick ~= self.tick then
-        check(item)
-      end
-    end
-
-    -- if pattern is a subset of the previous pattern, then
-    -- only process items that didn't match previously
-    if self.subset then
-      for i = 1, count do
+      -- Pass 2: emit matched items and their ancestors in source order
+      for i = 1, #picker.finder.items do
         local item = picker.finder.items[i]
-        if item.score == 0 and item.match_tick == self.tick - 1 then
-          item.match_tick = self.tick
+        if item.match_tick == self.tick and item.score > 0 then
+          picker.list:add(item, false)
         end
       end
-    end
+    else
+      ---@async
+      ---@param item snacks.picker.Item
+      local function check(item)
+        if self:update(picker, item) then
+          picker.list:add(item, self.sorting)
+        end
+        yield()
+      end
 
-    -- then the rest
-    local idx = 0
-    repeat
-      while idx < #picker.finder.items do
-        idx = idx + 1
-        local item = picker.finder.items[idx]
-        if item.match_tick ~= self.tick then
+      local count = #picker.finder.items
+
+      -- process topk first
+      for i = 1, count do
+        local item = picker.finder.items[i]
+        if item.match_topk then
+          item.match_topk = nil
+          check(item)
+        else
+          item.match_topk = nil
+        end
+      end
+
+      -- process matches next
+      for i = 1, count do
+        local item = picker.finder.items[i]
+        if item.score > 0 and item.match_tick ~= self.tick then
           check(item)
         end
       end
 
-      -- suspend till we have more items
-      if picker.finder.task:running() then
-        Async.suspend()
+      -- if pattern is a subset of the previous pattern, then
+      -- only process items that didn't match previously
+      if self.subset then
+        for i = 1, count do
+          local item = picker.finder.items[i]
+          if item.score == 0 and item.match_tick == self.tick - 1 then
+            item.match_tick = self.tick
+          end
+        end
       end
-    until idx >= #picker.finder.items and not picker.finder.task:running()
+
+      -- then the rest
+      local idx = 0
+      repeat
+        while idx < #picker.finder.items do
+          idx = idx + 1
+          local item = picker.finder.items[idx]
+          if item.match_tick ~= self.tick then
+            check(item)
+          end
+        end
+
+        -- suspend till we have more items
+        if picker.finder.task:running() then
+          Async.suspend()
+        end
+      until idx >= #picker.finder.items and not picker.finder.task:running()
+    end
 
     picker:update({ force = true })
     self:on_done(picker)
